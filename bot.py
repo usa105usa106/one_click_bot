@@ -137,30 +137,160 @@ def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_L
     raise RuntimeError("Не удалось получить klines ни с Binance, ни с Bybit, ни с MEXC. " + " | ".join(errors))
 
 
-def fetch_futures_context(symbol: str) -> dict:
-    ctx = {"funding": None, "open_interest": None, "depth_imbalance": None, "source": "Binance", "glassnode": "not_configured", "coinglass": "not_configured"}
+
+def _safe_float(x, default=None):
     try:
-        prem = http_get(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", {"symbol": symbol})
-        ctx["funding"] = float(prem.get("lastFundingRate", 0))
+        return float(x)
+    except Exception:
+        return default
+
+
+def _depth_metrics_from_books(bids, asks, top_n: int = 50) -> dict:
+    bids = bids[:top_n] if bids else []
+    asks = asks[:top_n] if asks else []
+    bid_qty = sum(_safe_float(x[1], 0.0) for x in bids)
+    ask_qty = sum(_safe_float(x[1], 0.0) for x in asks)
+    bid_notional = sum(_safe_float(x[0], 0.0) * _safe_float(x[1], 0.0) for x in bids)
+    ask_notional = sum(_safe_float(x[0], 0.0) * _safe_float(x[1], 0.0) for x in asks)
+    best_bid = _safe_float(bids[0][0]) if bids else None
+    best_ask = _safe_float(asks[0][0]) if asks else None
+    spread = (best_ask - best_bid) if best_bid and best_ask else None
+    imbalance = (bid_qty - ask_qty) / max(bid_qty + ask_qty, 1e-9)
+    notional_imbalance = (bid_notional - ask_notional) / max(bid_notional + ask_notional, 1e-9)
+    return {
+        "depth_imbalance": float(imbalance),
+        "notional_imbalance": float(notional_imbalance),
+        "bid_qty_top": float(bid_qty),
+        "ask_qty_top": float(ask_qty),
+        "spread": spread,
+    }
+
+
+def _merge_context(primary: dict, extra: dict) -> dict:
+    out = primary.copy()
+    for k, v in extra.items():
+        if out.get(k) is None and v is not None:
+            out[k] = v
+    return out
+
+
+def fetch_context_binance(symbol: str) -> dict:
+    ctx = {"source": "Binance", "funding": None, "open_interest": None, "depth_imbalance": None, "notional_imbalance": None, "long_short_ratio": None, "crowd_bias": "n/a"}
+    prem = http_get(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", {"symbol": symbol})
+    ctx["funding"] = _safe_float(prem.get("lastFundingRate"))
+    oi = http_get(f"{BINANCE_FUTURES}/fapi/v1/openInterest", {"symbol": symbol})
+    ctx["open_interest"] = _safe_float(oi.get("openInterest"))
+    depth = http_get(f"{BINANCE_FUTURES}/fapi/v1/depth", {"symbol": symbol, "limit": 100})
+    ctx.update(_depth_metrics_from_books(depth.get("bids", []), depth.get("asks", [])))
+    try:
+        ratio = http_get(f"{BINANCE_FUTURES}/futures/data/globalLongShortAccountRatio", {"symbol": symbol, "period": "5m", "limit": 1})
+        if ratio:
+            row = ratio[-1]
+            ctx["long_short_ratio"] = _safe_float(row.get("longShortRatio"))
+    except Exception as e:
+        ctx["long_short_error"] = str(e)
+    return ctx
+
+
+def fetch_context_bybit(symbol: str) -> dict:
+    ctx = {"source": "Bybit", "funding": None, "open_interest": None, "depth_imbalance": None, "notional_imbalance": None, "long_short_ratio": None, "crowd_bias": "n/a"}
+    tick = http_get(f"{BYBIT_BASE}/v5/market/tickers", {"category": "linear", "symbol": symbol})
+    rows = tick.get("result", {}).get("list", [])
+    if rows:
+        row = rows[0]
+        ctx["funding"] = _safe_float(row.get("fundingRate"))
+        ctx["open_interest"] = _safe_float(row.get("openInterest"))
+    ob = http_get(f"{BYBIT_BASE}/v5/market/orderbook", {"category": "linear", "symbol": symbol, "limit": 100})
+    result = ob.get("result", {})
+    ctx.update(_depth_metrics_from_books(result.get("b", []), result.get("a", [])))
+    try:
+        ratio = http_get(f"{BYBIT_BASE}/v5/market/account-ratio", {"category": "linear", "symbol": symbol, "period": "5min", "limit": 1})
+        rows = ratio.get("result", {}).get("list", [])
+        if rows:
+            row = rows[0]
+            buy = _safe_float(row.get("buyRatio"), None)
+            sell = _safe_float(row.get("sellRatio"), None)
+            if buy is not None and sell not in (None, 0):
+                ctx["long_short_ratio"] = buy / sell
+    except Exception as e:
+        ctx["long_short_error"] = str(e)
+    return ctx
+
+
+def fetch_context_mexc(symbol: str) -> dict:
+    ms = _mexc_symbol(symbol)
+    ctx = {"source": "MEXC", "funding": None, "open_interest": None, "depth_imbalance": None, "notional_imbalance": None, "long_short_ratio": None, "crowd_bias": "n/a"}
+    try:
+        fr = http_get(f"{MEXC_FUTURES}/api/v1/contract/funding_rate/{ms}")
+        data = fr.get("data", {}) if isinstance(fr, dict) else {}
+        ctx["funding"] = _safe_float(data.get("fundingRate"))
     except Exception as e:
         ctx["funding_error"] = str(e)
     try:
-        oi = http_get(f"{BINANCE_FUTURES}/fapi/v1/openInterest", {"symbol": symbol})
-        ctx["open_interest"] = float(oi.get("openInterest", 0))
+        oi = http_get(f"{MEXC_FUTURES}/api/v1/contract/open_interest/{ms}")
+        data = oi.get("data", {}) if isinstance(oi, dict) else {}
+        ctx["open_interest"] = _safe_float(data.get("holdVol") or data.get("openInterest"))
     except Exception as e:
         ctx["oi_error"] = str(e)
-    try:
-        depth = http_get(f"{BINANCE_FUTURES}/fapi/v1/depth", {"symbol": symbol, "limit": 100})
-        bid_qty = sum(float(x[1]) for x in depth.get("bids", [])[:50])
-        ask_qty = sum(float(x[1]) for x in depth.get("asks", [])[:50])
-        ctx["depth_imbalance"] = (bid_qty - ask_qty) / max(bid_qty + ask_qty, 1e-9)
-    except Exception as e:
-        ctx["depth_error"] = str(e)
-    if os.getenv("GLASSNODE_API_KEY"):
-        ctx["glassnode"] = "api_key_present_optional_hook"
-    if os.getenv("COINGLASS_API_KEY"):
-        ctx["coinglass"] = "api_key_present_optional_hook"
+    depth = http_get(f"{MEXC_FUTURES}/api/v1/contract/depth/{ms}", {"limit": 100})
+    data = depth.get("data", {}) if isinstance(depth, dict) else {}
+    ctx.update(_depth_metrics_from_books(data.get("bids", []), data.get("asks", [])))
     return ctx
+
+
+def analyze_crowd(ctx: dict, side_hint: str | None = None) -> dict:
+    """Contrarian crowd/squeeze read from funding, long-short ratio and orderbook imbalance."""
+    funding = ctx.get("funding")
+    ratio = ctx.get("long_short_ratio")
+    depth_imb = ctx.get("depth_imbalance")
+    score = 0.0
+    notes = []
+    if ratio is not None:
+        if ratio > 1.25:
+            score -= min((ratio - 1.0) * 12, 8); notes.append("толпа перегружена в LONG")
+        elif ratio < 0.80:
+            score += min((1.0 - ratio) * 12, 8); notes.append("толпа перегружена в SHORT")
+        else:
+            notes.append("толпа сбалансирована")
+    if funding is not None:
+        if funding > 0.00025:
+            score -= 3; notes.append("funding дорогой для лонгов: риск long squeeze")
+        elif funding < -0.00025:
+            score += 3; notes.append("funding дорогой для шортов: риск short squeeze")
+    if depth_imb is not None:
+        if depth_imb > 0.08:
+            score += 2; notes.append("в стакане сильнее bids")
+        elif depth_imb < -0.08:
+            score -= 2; notes.append("в стакане сильнее asks")
+    if score > 2.5:
+        smart = "smart money / squeeze bias: UP"
+    elif score < -2.5:
+        smart = "smart money / squeeze bias: DOWN"
+    else:
+        smart = "smart money / squeeze bias: NEUTRAL"
+    return {"score": float(score), "summary": smart, "notes": "; ".join(notes) if notes else "нет данных", "ratio": ratio}
+
+
+def fetch_futures_context(symbol: str) -> dict:
+    errors = []
+    base = {"funding": None, "open_interest": None, "depth_imbalance": None, "notional_imbalance": None, "long_short_ratio": None, "source": "n/a", "glassnode": "not_configured", "coinglass": "not_configured"}
+    for name, fn in (("Binance", fetch_context_binance), ("Bybit", fetch_context_bybit), ("MEXC", fetch_context_mexc)):
+        try:
+            ctx = fn(symbol)
+            if any(ctx.get(k) is not None for k in ("funding", "open_interest", "depth_imbalance")):
+                ctx = _merge_context({**base, "source": name}, ctx)
+                ctx["crowd"] = analyze_crowd(ctx)
+                if os.getenv("GLASSNODE_API_KEY"):
+                    ctx["glassnode"] = "api_key_present_optional_hook"
+                if os.getenv("COINGLASS_API_KEY"):
+                    ctx["coinglass"] = "api_key_present_optional_hook"
+                return ctx
+            errors.append(f"{name}: empty context")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    base["context_errors"] = " | ".join(errors)
+    base["crowd"] = analyze_crowd(base)
+    return base
 
 
 def ema(s, p): return s.ewm(span=p, adjust=False).mean()
@@ -339,6 +469,36 @@ def backtest_quality(df, direction):
             total += 1; wins += int(hit_sl is None or (hit_tp is not None and hit_tp < hit_sl))
     return (wins / total if total else 0.5), total
 
+
+def walk_forward_quality(df: pd.DataFrame, direction: str, windows: int = 4) -> dict:
+    """Simple walk-forward validation: splits recent history into sequential out-of-sample chunks."""
+    d = df.dropna().copy().tail(420)
+    if len(d) < 160:
+        return {"winrate": 0.5, "trades": 0, "windows": 0, "stability": 0.0}
+    chunk = max(60, len(d) // windows)
+    rates, trades_total = [], 0
+    for start in range(0, max(1, len(d) - chunk + 1), chunk):
+        part = d.iloc[start:start + chunk]
+        if len(part) < 60:
+            continue
+        wr, n = backtest_quality(part, direction)
+        if n > 0:
+            rates.append(wr); trades_total += n
+    if not rates:
+        return {"winrate": 0.5, "trades": 0, "windows": 0, "stability": 0.0}
+    stability = 1.0 - min(float(np.std(rates)) * 2.5, 1.0)
+    return {"winrate": float(np.mean(rates)), "trades": int(trades_total), "windows": len(rates), "stability": float(stability)}
+
+
+def news_risk_filter() -> dict:
+    """Optional manual/news hook. Set NEWS_RISK=high before CPI/FOMC/etc. to reduce confidence."""
+    risk = os.getenv("NEWS_RISK", "normal").strip().lower()
+    high_words = {"high", "fomc", "cpi", "nfp", "fed", "rate", "panic"}
+    if risk in high_words:
+        return {"risk": "high", "penalty": 6, "note": "High-impact news filter активен: лучше уменьшить риск/плечо"}
+    return {"risk": "normal", "penalty": 0, "note": "High-impact news filter: normal"}
+
+
 def ai_prediction_score(df, mtf_scores):
     last = df.iloc[-1]
     features = np.array([
@@ -359,7 +519,7 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
     frames = {tf: add_indicators(raw_frames[tf]) for tf in raw_frames}
     df = frames[PRIMARY_TF] if PRIMARY_TF in frames else frames[TIMEFRAMES[0]]
     exchange = raw_frames.get(PRIMARY_TF, next(iter(raw_frames.values()))).attrs.get("exchange", "n/a")
-    ctx = fetch_futures_context(symbol) if exchange == "Binance" else {"funding": None, "open_interest": None, "depth_imbalance": None, "source": exchange, "glassnode": "not_configured", "coinglass": "not_configured"}
+    ctx = fetch_futures_context(symbol)
     ms = market_structure(df)
     vp = volume_profile(df)
     heat = liquidity_heatmap(df, ctx)
@@ -394,7 +554,14 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
     if ctx.get("depth_imbalance") is not None:
         imb = ctx["depth_imbalance"]; score += 5*np.tanh(imb*3); reasons.append(f"Orderbook imbalance: {imb:+.2%}")
     if ctx.get("funding") is not None:
-        fr = ctx["funding"]; score -= np.sign(fr)*min(abs(fr)*50000, 4); reasons.append(f"Funding Binance Futures: {fr*100:.4f}%")
+        fr = ctx["funding"]; score -= np.sign(fr)*min(abs(fr)*50000, 4); reasons.append(f"Funding {ctx.get('source','Exchange')}: {fr*100:.4f}%")
+    crowd = ctx.get("crowd", analyze_crowd(ctx))
+    score += crowd.get("score", 0.0)
+    reasons.append(f"Crowd/Squeeze: {crowd.get('summary')} · {crowd.get('notes')}")
+    news = news_risk_filter()
+    if news["penalty"]:
+        score -= np.sign(score) * news["penalty"]
+    reasons.append(news["note"])
 
     # Volume Profile / VPVR
     if price > vp["poc"]:
@@ -424,8 +591,10 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
 
     side = "LONG" if score >= 0 else "SHORT"
     winrate, trades = backtest_quality(df, side)
-    score += (winrate - .5) * 22
-    confidence = int(max(7, min(94, 50 + abs(score) * .72 + (winrate-.5)*20)))
+    wf = walk_forward_quality(df, side)
+    blended_wr = (winrate * 0.55) + (wf["winrate"] * 0.45)
+    score += (blended_wr - .5) * 24
+    confidence = int(max(7, min(94, 50 + abs(score) * .72 + (blended_wr-.5)*20 + wf["stability"]*4)))
     # Итоговые вероятности LONG/SHORT: показываются пользователю одной строкой.
     long_probability = int(round(100 / (1 + math.exp(-score / 18))))
     short_probability = 100 - long_probability
@@ -433,7 +602,7 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
     regime = reg["regime"]
     decision = "Проходимость: высокая" if confidence >= 75 else "Проходимость: средняя" if confidence >= 58 else "Проходимость: низкая / лучше ждать"
     nearest_fib = min(fibs.items(), key=lambda kv: abs(price-kv[1])); reasons.append(f"Ближайший Fibonacci {nearest_fib[0]}: {nearest_fib[1]:,.2f}")
-    reasons.append(f"Backtester по последним данным: winrate {winrate*100:.1f}% на {trades} тест-сделках")
+    reasons.append(f"Backtester: simple {winrate*100:.1f}%/{trades} trades; walk-forward {wf['winrate']*100:.1f}%/{wf['trades']} trades, stability {wf['stability']:.0%}")
     reasons.append(f"Glassnode: {ctx['glassnode']}; Coinglass: {ctx['coinglass']} (хуки под API-ключи оставлены)")
 
     if side == "LONG":
@@ -442,7 +611,7 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
         stop = max(price + 1.35*atr_v, ms["liq_high"] + .15*atr_v); take1, take2, take3 = price-1.15*atr_v, price-2.05*atr_v, price-3.25*atr_v; rr=(price-take2)/max(stop-price,1e-9)
 
     text = (
-        f"🏦 HEDGE FUND / FULL AI QUANT SYSTEM\n📊 {symbol} · Binance Futures · TF {PRIMARY_TF}\n"
+        f"🏦 HEDGE FUND / FULL AI QUANT SYSTEM\n📊 {symbol} · Data: candles {exchange}, context {ctx.get('source','n/a')} · TF {PRIMARY_TF}\n"
         f"Цена: {price:,.2f}\nРежим рынка: {regime}\n\n"
         f"Решение: {side}\n"
         f"LONG probability: {long_probability}%\n"
@@ -456,7 +625,10 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
         f"VPVR POC/VAH/VAL: {vp['poc']:,.2f} / {vp['vah']:,.2f} / {vp['val']:,.2f}\n"
         f"Heatmap magnets: up {heat['magnet_up']:,.2f}, down {heat['magnet_down']:,.2f}\n"
         f"Orderflow: {oflow['dominance']} · delta {oflow['delta_strength']:+.2%}\n"
-        f"Open interest: {ctx.get('open_interest') or 'n/a'}\n\n"
+        f"Open interest: {ctx.get('open_interest') or 'n/a'}\n"
+        f"Funding: {ctx.get('funding') if ctx.get('funding') is not None else 'n/a'}\n"
+        f"Long/Short ratio: {ctx.get('long_short_ratio') if ctx.get('long_short_ratio') is not None else 'n/a'}\n"
+        f"Smart money: {ctx.get('crowd', {}).get('summary', 'n/a')}\n\n"
         "Факторы:\n- " + "\n- ".join(reasons[:13]) +
         "\n\n⚠️ Не финансовый совет. Вероятность — это модельный confidence, не гарантия прибыли."
     )
