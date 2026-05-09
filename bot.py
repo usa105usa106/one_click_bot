@@ -16,6 +16,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 START_TIME = time.time()
 BINANCE_SPOT = os.getenv("BINANCE_SPOT", "https://api.binance.com")
 BINANCE_FUTURES = os.getenv("BINANCE_FUTURES", "https://fapi.binance.com")
+BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api.bybit.com")
+MEXC_FUTURES = os.getenv("MEXC_FUTURES", "https://contract.mexc.com")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "500"))
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))
 PRIMARY_TF = os.getenv("PRIMARY_TF", "1h")
@@ -44,21 +46,99 @@ def http_get(url: str, params: dict | None = None):
     return r.json()
 
 
-def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_LIMIT, futures: bool = True) -> pd.DataFrame:
+def _empty_klines_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"])
+
+
+def _normalize_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return _empty_klines_df()
+    for c in ["open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "taker_buy_vol" not in df.columns:
+        # Bybit/MEXC public kline endpoints usually do not expose taker-buy volume.
+        # Use half of volume as a neutral fallback so CVD/orderflow modules keep working.
+        df["taker_buy_vol"] = df["volume"] * 0.5
+    if "trades" not in df.columns:
+        df["trades"] = 0
+    return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna().sort_values("time").reset_index(drop=True)
+
+
+def fetch_klines_binance(symbol: str, interval: str, limit: int, futures: bool = True) -> pd.DataFrame:
     base = BINANCE_FUTURES if futures else BINANCE_SPOT
     path = "/fapi/v1/klines" if futures else "/api/v3/klines"
     raw = http_get(f"{base}{path}", {"symbol": symbol, "interval": interval, "limit": limit})
     cols = ["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "tbav", "tqav", "ignore"]
     df = pd.DataFrame(raw, columns=cols)
-    for c in ["open", "high", "low", "close", "volume", "qav", "tbav", "tqav"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
     df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     df["taker_buy_vol"] = pd.to_numeric(df["tbav"], errors="coerce")
-    return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna()
+    return _normalize_ohlcv(df)
+
+
+def _bybit_interval(interval: str) -> str:
+    return {"1m":"1", "3m":"3", "5m":"5", "15m":"15", "30m":"30", "1h":"60", "2h":"120", "4h":"240", "6h":"360", "12h":"720", "1d":"D", "1w":"W", "1M":"M"}.get(interval, interval)
+
+
+def fetch_klines_bybit(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    raw = http_get(f"{BYBIT_BASE}/v5/market/kline", {"category": "linear", "symbol": symbol, "interval": _bybit_interval(interval), "limit": min(limit, 1000)})
+    if raw.get("retCode") not in (0, "0"):
+        raise RuntimeError(f"Bybit error: {raw.get('retMsg') or raw}")
+    rows = raw.get("result", {}).get("list", [])
+    if not rows:
+        raise RuntimeError("Bybit returned empty klines")
+    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"][:len(rows[0])])
+    df["time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms", utc=True)
+    return _normalize_ohlcv(df)
+
+
+def _mexc_symbol(symbol: str) -> str:
+    return symbol[:-4] + "_USDT" if symbol.endswith("USDT") else symbol
+
+
+def _mexc_interval(interval: str) -> str:
+    return {"1m":"Min1", "5m":"Min5", "15m":"Min15", "30m":"Min30", "1h":"Min60", "4h":"Hour4", "8h":"Hour8", "1d":"Day1", "1w":"Week1", "1M":"Month1"}.get(interval, interval)
+
+
+def fetch_klines_mexc(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    raw = http_get(f"{MEXC_FUTURES}/api/v1/contract/kline/{_mexc_symbol(symbol)}", {"interval": _mexc_interval(interval)})
+    if not raw.get("success", False):
+        raise RuntimeError(f"MEXC error: {raw.get('message') or raw}")
+    data = raw.get("data", {})
+    times = data.get("time", [])[-limit:]
+    if not times:
+        raise RuntimeError("MEXC returned empty klines")
+    df = pd.DataFrame({
+        "time": pd.to_datetime(times, unit="s", utc=True),
+        "open": data.get("open", [])[-limit:],
+        "high": data.get("high", [])[-limit:],
+        "low": data.get("low", [])[-limit:],
+        "close": data.get("close", [])[-limit:],
+        "volume": data.get("vol", data.get("volume", []))[-limit:],
+    })
+    return _normalize_ohlcv(df)
+
+
+def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_LIMIT, futures: bool = True) -> pd.DataFrame:
+    errors = []
+    for name, fn in (
+        ("Binance", lambda: fetch_klines_binance(symbol, interval, limit, futures)),
+        ("Bybit", lambda: fetch_klines_bybit(symbol, interval, limit)),
+        ("MEXC", lambda: fetch_klines_mexc(symbol, interval, limit)),
+    ):
+        try:
+            df = fn()
+            if not df.empty:
+                df.attrs["exchange"] = name
+                return df
+            errors.append(f"{name}: empty response")
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+    raise RuntimeError("Не удалось получить klines ни с Binance, ни с Bybit, ни с MEXC. " + " | ".join(errors))
 
 
 def fetch_futures_context(symbol: str) -> dict:
-    ctx = {"funding": None, "open_interest": None, "depth_imbalance": None, "glassnode": "not_configured", "coinglass": "not_configured"}
+    ctx = {"funding": None, "open_interest": None, "depth_imbalance": None, "source": "Binance", "glassnode": "not_configured", "coinglass": "not_configured"}
     try:
         prem = http_get(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", {"symbol": symbol})
         ctx["funding"] = float(prem.get("lastFundingRate", 0))
@@ -275,9 +355,11 @@ def ai_prediction_score(df, mtf_scores):
     return prob_up, features
 
 def analyze(symbol: str) -> tuple[Signal, dict]:
-    frames = {tf: add_indicators(fetch_klines(symbol, tf, DEFAULT_LIMIT, True)) for tf in TIMEFRAMES}
+    raw_frames = {tf: fetch_klines(symbol, tf, DEFAULT_LIMIT, True) for tf in TIMEFRAMES}
+    frames = {tf: add_indicators(raw_frames[tf]) for tf in raw_frames}
     df = frames[PRIMARY_TF] if PRIMARY_TF in frames else frames[TIMEFRAMES[0]]
-    ctx = fetch_futures_context(symbol)
+    exchange = raw_frames.get(PRIMARY_TF, next(iter(raw_frames.values()))).attrs.get("exchange", "n/a")
+    ctx = fetch_futures_context(symbol) if exchange == "Binance" else {"funding": None, "open_interest": None, "depth_imbalance": None, "source": exchange, "glassnode": "not_configured", "coinglass": "not_configured"}
     ms = market_structure(df)
     vp = volume_profile(df)
     heat = liquidity_heatmap(df, ctx)
@@ -378,7 +460,7 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
         "Факторы:\n- " + "\n- ".join(reasons[:13]) +
         "\n\n⚠️ Не финансовый совет. Вероятность — это модельный confidence, не гарантия прибыли."
     )
-    return Signal(side, confidence, price, stop, take1, take2, take3, rr, text, regime, score), {"df": df, "frames": frames, "highs": highs, "lows": lows, "res_line": res_line, "sup_line": sup_line, "fibs": fibs, "ms": ms, "ctx": ctx, "vp": vp, "heat": heat, "oflow": oflow, "reg": reg}
+    return Signal(side, confidence, price, stop, take1, take2, take3, rr, text, regime, score), {"df": df, "frames": frames, "exchange": exchange, "highs": highs, "lows": lows, "res_line": res_line, "sup_line": sup_line, "fibs": fibs, "ms": ms, "ctx": ctx, "vp": vp, "heat": heat, "oflow": oflow, "reg": reg}
 
 
 def make_chart(symbol, data, signal):
@@ -435,7 +517,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import psutil; mem=f"{psutil.Process(os.getpid()).memory_info().rss/1024/1024:.1f} MB"
     except Exception: pass
-    await update.message.reply_text(f"Работает: {uptime//3600}h {(uptime%3600)//60}m {uptime%60}s\nПамять: {mem}\nБиржа: Binance Futures\nTF: {','.join(TIMEFRAMES)}")
+    await update.message.reply_text(f"Работает: {uptime//3600}h {(uptime%3600)//60}m {uptime%60}s\nПамять: {mem}\nБиржи: Binance → Bybit → MEXC\nTF: {','.join(TIMEFRAMES)}")
 
 async def run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     target = update.callback_query.message if update.callback_query else update.message
